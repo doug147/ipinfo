@@ -11,6 +11,12 @@ Outputs:
 
 Search mode:
   - Search for IP ranges matching ASN, country, region, city criteria
+
+Sorting:
+  - Lookup default: sort by IP
+  - Search default: sort by network
+  - Use --sort to choose fields, e.g. --sort asn,ip or --sort -asn,ip
+  - Use --sort none (or input/preserve) to keep original order
 """
 
 from __future__ import annotations
@@ -20,10 +26,11 @@ import csv
 import ipaddress
 import json
 import sys
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from dataclasses import asdict, dataclass, field
+from functools import cmp_to_key
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set, TextIO, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, TextIO, Tuple
 
 import geoip2.database
 import geoip2.errors
@@ -137,6 +144,209 @@ SEARCH_CSV_FIELDS: Sequence[str] = (
 )
 
 
+def _ip_value(ip_str: str) -> Optional[Tuple[int, int]]:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return (addr.version, int(addr))
+    except ValueError:
+        return None
+
+
+def _network_value(net_str: str) -> Optional[Tuple[int, int, int]]:
+    try:
+        net = ipaddress.ip_network(net_str, strict=False)
+        return (net.version, int(net.network_address), int(net.prefixlen))
+    except ValueError:
+        return None
+
+
+def _casefold(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    return v.casefold()
+
+
+_LOOKUP_SORT_ALIASES: Dict[str, str] = {
+    "asn": "asn_number",
+    "asnnum": "asn_number",
+    "org": "asn_org",
+    "country": "country_iso",
+    "cc": "country_iso",
+    "region": "region_iso",
+    "state": "region_iso",
+    "city": "city_name",
+    "postal": "postal_code",
+    "zip": "postal_code",
+    "tz": "time_zone",
+    "lat": "latitude",
+    "lon": "longitude",
+    "lng": "longitude",
+    "anycast": "is_anycast",
+    "net": "traits_network",
+    "network": "traits_network",
+}
+
+_LOOKUP_SORT_GETTERS: Dict[str, Callable[[GeoIPResult], Any]] = {
+    "ip": lambda r: _ip_value(r.ip),
+    "status": lambda r: _casefold(r.status),
+    "error": lambda r: _casefold(r.error),
+    "asn_number": lambda r: r.asn_number,
+    "asn_org": lambda r: _casefold(r.asn_org),
+    "asn_network": lambda r: _network_value(r.asn_network) if r.asn_network else None,
+    "continent_code": lambda r: _casefold(r.continent_code),
+    "continent_name": lambda r: _casefold(r.continent_name),
+    "country_iso": lambda r: _casefold(r.country_iso),
+    "country_name": lambda r: _casefold(r.country_name),
+    "region_iso": lambda r: _casefold(r.region_iso),
+    "region_name": lambda r: _casefold(r.region_name),
+    "city_name": lambda r: _casefold(r.city_name),
+    "postal_code": lambda r: _casefold(r.postal_code),
+    "latitude": lambda r: r.latitude,
+    "longitude": lambda r: r.longitude,
+    "accuracy_radius_km": lambda r: r.accuracy_radius_km,
+    "time_zone": lambda r: _casefold(r.time_zone),
+    "traits_network": lambda r: _network_value(r.traits_network) if r.traits_network else None,
+    "is_anycast": lambda r: r.is_anycast,
+}
+
+_SEARCH_SORT_ALIASES: Dict[str, str] = {
+    "net": "network",
+    "cidr": "network",
+    "asn": "asn_number",
+    "asnnum": "asn_number",
+    "org": "asn_org",
+    "country": "country_iso",
+    "cc": "country_iso",
+    "region": "region_iso",
+    "state": "region_iso",
+    "city": "city_name",
+    "postal": "postal_code",
+    "zip": "postal_code",
+    "lat": "latitude",
+    "lon": "longitude",
+    "lng": "longitude",
+}
+
+_SEARCH_SORT_GETTERS: Dict[str, Callable[[SearchResult], Any]] = {
+    "network": lambda r: _network_value(r.network),
+    "asn_number": lambda r: r.asn_number,
+    "asn_org": lambda r: _casefold(r.asn_org),
+    "country_iso": lambda r: _casefold(r.country_iso),
+    "country_name": lambda r: _casefold(r.country_name),
+    "region_iso": lambda r: _casefold(r.region_iso),
+    "region_name": lambda r: _casefold(r.region_name),
+    "city_name": lambda r: _casefold(r.city_name),
+    "postal_code": lambda r: _casefold(r.postal_code),
+    "latitude": lambda r: r.latitude,
+    "longitude": lambda r: r.longitude,
+}
+
+
+def _parse_sort_fields(
+    sort_arg: Optional[str],
+    default_sort: Optional[str],
+    default_desc: bool,
+    aliases: Dict[str, str],
+    getters: Dict[str, Callable],
+) -> List[Tuple[str, bool]]:
+    raw = sort_arg if sort_arg is not None else default_sort
+    if raw is None:
+        return []
+    raw = raw.strip()
+    if not raw:
+        return []
+    if raw.lower() in ("none", "input", "preserve"):
+        return []
+
+    specs: List[Tuple[str, bool]] = []
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+
+        desc = default_desc
+        if token[0] in "+-":
+            desc = token[0] == "-"
+            token = token[1:].strip()
+        if not token:
+            continue
+
+        field = aliases.get(token.lower(), token.lower())
+        if field not in getters:
+            allowed = ", ".join(sorted(getters.keys()))
+            raise ValueError(f"Unknown sort field '{token}'. Allowed fields: {allowed}")
+
+        specs.append((field, desc))
+
+    return specs
+
+
+def _ensure_tiebreak(specs: List[Tuple[str, bool]], field: str) -> List[Tuple[str, bool]]:
+    if any(f == field for f, _ in specs):
+        return specs
+    return specs + [(field, False)]
+
+
+def _cmp_values(a: Any, b: Any, desc: bool) -> int:
+    if a is None and b is None:
+        return 0
+    if a is None:
+        return 1
+    if b is None:
+        return -1
+
+    if a < b:
+        return 1 if desc else -1
+    if a > b:
+        return -1 if desc else 1
+    return 0
+
+
+def _make_comparator(specs: List[Tuple[str, bool]], getters: Dict[str, Callable]) -> Callable[[Any, Any], int]:
+    def cmp(x: Any, y: Any) -> int:
+        for field, desc in specs:
+            vx = getters[field](x)
+            vy = getters[field](y)
+            c = _cmp_values(vx, vy, desc)
+            if c != 0:
+                return c
+        return 0
+
+    return cmp
+
+
+def sort_geoip_results(results: Sequence[GeoIPResult], sort_arg: Optional[str], sort_desc: bool) -> List[GeoIPResult]:
+    specs = _parse_sort_fields(
+        sort_arg=sort_arg,
+        default_sort="ip",
+        default_desc=sort_desc,
+        aliases=_LOOKUP_SORT_ALIASES,
+        getters=_LOOKUP_SORT_GETTERS,
+    )
+    if not specs:
+        return list(results)
+
+    specs = _ensure_tiebreak(specs, "ip")
+    cmp = _make_comparator(specs, _LOOKUP_SORT_GETTERS)
+    return sorted(results, key=cmp_to_key(cmp))
+
+
+def sort_search_results(results: Sequence[SearchResult], sort_arg: Optional[str], sort_desc: bool) -> List[SearchResult]:
+    specs = _parse_sort_fields(
+        sort_arg=sort_arg,
+        default_sort="network",
+        default_desc=sort_desc,
+        aliases=_SEARCH_SORT_ALIASES,
+        getters=_SEARCH_SORT_GETTERS,
+    )
+    if not specs:
+        return list(results)
+
+    specs = _ensure_tiebreak(specs, "network")
+    cmp = _make_comparator(specs, _SEARCH_SORT_GETTERS)
+    return sorted(results, key=cmp_to_key(cmp))
+
+
 class GeoIPService:
     def __init__(self, asn_db: Path, city_db: Path) -> None:
         self.asn_db = asn_db
@@ -233,10 +443,10 @@ class GeoIPService:
 class SearchCriteria:
     """Criteria for searching IP ranges."""
     asn: Optional[int] = None
-    asn_org_pattern: Optional[str] = None  # substring match
+    asn_org_pattern: Optional[str] = None
     country_iso: Optional[str] = None
     region_iso: Optional[str] = None
-    city_pattern: Optional[str] = None  # substring match
+    city_pattern: Optional[str] = None
     ipv4_only: bool = True
     ipv6_only: bool = False
     limit: Optional[int] = None
@@ -272,14 +482,14 @@ class SearchCriteria:
 
 
 def extract_geo_from_city_data(data: dict) -> Tuple[
-    Optional[str],  # country_iso
-    Optional[str],  # country_name
-    Optional[str],  # region_iso
-    Optional[str],  # region_name
-    Optional[str],  # city_name
-    Optional[str],  # postal_code
-    Optional[float],  # latitude
-    Optional[float],  # longitude
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[float],
+    Optional[float],
 ]:
     """Extract geographic info from city database record."""
     country = data.get("country", {})
@@ -328,11 +538,9 @@ class NetworkIntervalIndex:
     """
 
     def __init__(self):
-        # Separate indices for IPv4 and IPv6
-        # Each is a list of (start, end, asn_num, asn_org) sorted by start
         self._v4_intervals: List[Tuple[int, int, int, str]] = []
         self._v6_intervals: List[Tuple[int, int, int, str]] = []
-        self._v4_starts: List[int] = []  # For binary search
+        self._v4_starts: List[int] = []
         self._v6_starts: List[int] = []
         self._built = False
 
@@ -379,31 +587,16 @@ class NetworkIntervalIndex:
         if not intervals:
             return None
 
-        # Find intervals that could potentially overlap
-        # An interval (s, e) overlaps with (query_start, query_end) if:
-        #   s <= query_end AND e >= query_start
-
-        # Use binary search to find the rightmost interval that starts <= query_end
         right_idx = bisect_right(starts, query_end)
-
-        # Check intervals from 0 to right_idx-1
-        # But we can also skip intervals that end before query_start
-        # For efficiency, we'll check a reasonable window
 
         for i in range(right_idx - 1, -1, -1):
             iv_start, iv_end, asn_num, asn_org = intervals[i]
 
-            # If this interval ends before our query starts, and all previous
-            # intervals start even earlier, we can stop
             if iv_end < query_start:
-                # But we need to be careful - earlier intervals might have larger ranges
-                # So we can't just break. However, for most cases this is still fast.
-                # Let's continue but with a cutoff
-                if iv_start < query_start - (1 << 24):  # Heuristic cutoff for /8
+                if iv_start < query_start - (1 << 24):
                     break
                 continue
 
-            # Check for overlap: iv_start <= query_end AND iv_end >= query_start
             if iv_start <= query_end and iv_end >= query_start:
                 return (asn_num, asn_org)
 
@@ -439,7 +632,6 @@ def search_networks(
         except ValueError:
             return None
 
-    # If we have ASN criteria, build an interval index of matching ASN networks
     if criteria.asn is not None or criteria.asn_org_pattern is not None:
         if progress_callback:
             progress_callback("Building ASN network index...")
@@ -471,7 +663,6 @@ def search_networks(
                 progress_callback("No matching ASN networks found")
             return
 
-        # If we also have geo criteria, scan City DB and check overlaps
         if criteria.country_iso or criteria.region_iso or criteria.city_pattern:
             with maxminddb.open_database(str(city_db_path)) as city_reader:
                 for network_str, data in city_reader:
@@ -485,14 +676,12 @@ def search_networks(
                     if version is None or not should_include_version(version):
                         continue
 
-                    # Fast overlap check using interval index
                     asn_match = asn_index.find_overlapping(network_str)
                     if asn_match is None:
                         continue
 
                     asn_num, asn_org = asn_match
 
-                    # Extract and check geo
                     (
                         country_iso,
                         country_name,
@@ -522,7 +711,6 @@ def search_networks(
                         longitude=longitude,
                     )
         else:
-            # No geo criteria - return ASN networks directly (need to get geo for each)
             with maxminddb.open_database(str(asn_db_path)) as asn_reader:
                 with maxminddb.open_database(str(city_db_path)) as city_reader:
                     for network_str, data in asn_reader:
@@ -542,7 +730,6 @@ def search_networks(
                         if not criteria.matches_asn(asn_num, asn_org):
                             continue
 
-                        # Get geo info for this network
                         country_iso = country_name = region_iso = region_name = None
                         city_name = postal_code = None
                         latitude = longitude = None
@@ -581,7 +768,6 @@ def search_networks(
                         )
 
     else:
-        # No ASN criteria - iterate city database for geo matches
         if progress_callback:
             progress_callback("Scanning City database...")
 
@@ -612,7 +798,6 @@ def search_networks(
                     if not criteria.matches_geo(country_iso, region_iso, city_name):
                         continue
 
-                    # Look up ASN info
                     asn_num = None
                     asn_org = None
                     try:
@@ -829,7 +1014,6 @@ def render_csv(results: Sequence[GeoIPResult], out: TextIO, header: bool = True)
         writer.writerow(row)
 
 
-# Search result renderers
 def render_search_pretty(results: Sequence[SearchResult], out: TextIO) -> None:
     for idx, r in enumerate(results):
         if idx:
@@ -955,6 +1139,12 @@ Examples:
   # Look up multiple IPs
   %(prog)s 8.8.8.8 1.1.1.1 9.9.9.9
 
+  # Look up multiple IPs, sort by ASN then IP
+  %(prog)s 8.8.8.8 1.1.1.1 9.9.9.9 --sort asn,ip
+
+  # Look up multiple IPs, preserve input order
+  %(prog)s 8.8.8.8 1.1.1.1 9.9.9.9 --sort input
+
   # Search for networks in Georgia (GA) belonging to AS63949
   %(prog)s --search --asn AS63949 --region GA
 
@@ -964,12 +1154,11 @@ Examples:
   # Search and output just network CIDRs
   %(prog)s --search --asn 63949 --region GA --format networks
 
-  # Search with limit
-  %(prog)s --search --asn 63949 --limit 100
+  # Search with limit, sort by ASN descending then network ascending
+  %(prog)s --search --asn 63949 --limit 100 --sort -asn,network
 """,
     )
 
-    # Mode selection
     mode_group = parser.add_argument_group("mode")
     mode_group.add_argument(
         "--search",
@@ -977,7 +1166,6 @@ Examples:
         help="Search mode: find networks matching criteria instead of looking up IPs",
     )
 
-    # Lookup mode arguments
     lookup_group = parser.add_argument_group("lookup options")
     lookup_group.add_argument("ips", nargs="*", help="IP address(es) to look up")
     lookup_group.add_argument(
@@ -987,7 +1175,6 @@ Examples:
         help="Read IPs from file (one per line). Use '-' to read from stdin.",
     )
 
-    # Search mode arguments
     search_group = parser.add_argument_group("search options")
     search_group.add_argument(
         "--asn",
@@ -1030,7 +1217,6 @@ Examples:
         help="Maximum number of results to return",
     )
 
-    # Database paths
     db_group = parser.add_argument_group("database options")
     db_group.add_argument(
         "--asn-db",
@@ -1045,7 +1231,6 @@ Examples:
         help=f"Path to GeoLite2 City database (default: {DEFAULT_CITY_DB})",
     )
 
-    # Output options
     output_group = parser.add_argument_group("output options")
     output_group.add_argument(
         "--format",
@@ -1086,6 +1271,22 @@ Examples:
         action="store_true",
         help="Exit non-zero if any IP is invalid or a lookup errors out",
     )
+    output_group.add_argument(
+        "--sort",
+        type=str,
+        default=None,
+        help=(
+            "Sort results by field(s). Comma-separated; prefix with '-' for descending. "
+            "Lookup default: ip. Search default: network. "
+            "Use --sort none or --sort input to disable sorting. "
+            "Examples: --sort ip ; --sort asn,ip ; --sort -country_iso,city_name"
+        ),
+    )
+    output_group.add_argument(
+        "--sort-desc",
+        action="store_true",
+        help="Sort descending by default for fields without a leading +/-.",
+    )
 
     return parser.parse_args(argv)
 
@@ -1093,19 +1294,19 @@ Examples:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    # Validate database paths
     for db_path, label in ((args.asn_db, "ASN"), (args.city_db, "City")):
         if not db_path.exists():
             print(f"error: {label} database not found: {db_path}", file=sys.stderr)
             return 2
 
     if args.search:
-        # Search mode
         if not any([args.asn, args.asn_org, args.country, args.region, args.city]):
-            print("error: search mode requires at least one filter (--asn, --asn-org, --country, --region, --city)", file=sys.stderr)
+            print(
+                "error: search mode requires at least one filter (--asn, --asn-org, --country, --region, --city)",
+                file=sys.stderr,
+            )
             return 2
 
-        # Parse ASN if provided
         asn_num = None
         if args.asn:
             try:
@@ -1135,6 +1336,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"error: search failed: {e}", file=sys.stderr)
             return 2
 
+        try:
+            results = sort_search_results(results, args.sort, args.sort_desc)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+
         if not args.quiet:
             print(f"Found {len(results)} matching networks", file=sys.stderr)
 
@@ -1158,55 +1365,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         return 0
 
-    else:
-        # Lookup mode (original behavior)
-        try:
-            ip_list = iter_ips_from_sources(args.ips, args.file)
-        except FileNotFoundError as e:
-            print(f"error: {e}", file=sys.stderr)
+    try:
+        ip_list = iter_ips_from_sources(args.ips, args.file)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    if not ip_list:
+        print("error: no IP addresses provided (use positional args or -f FILE)", file=sys.stderr)
+        return 2
+
+    results: List[GeoIPResult] = []
+    strict_fail = False
+
+    try:
+        with GeoIPService(args.asn_db, args.city_db) as svc:
+            for ip in ip_list:
+                r = svc.lookup(ip, verbose=args.verbose)
+                results.append(r)
+                if args.strict and r.status not in ("ok", "partial", "not_found"):
+                    strict_fail = True
+                if args.strict and r.status == "error":
+                    strict_fail = True
+    except Exception as e:
+        print(f"error: failed to open databases or perform lookups: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        results = sort_geoip_results(results, args.sort, args.sort_desc)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    with open_output(args.output) as out:
+        header = not args.no_header
+
+        if args.format == "pretty":
+            render_pretty(results, out=out, verbose=args.verbose)
+            out.write("\n")
+        elif args.format == "table":
+            render_table(results, out=out, verbose=args.verbose, header=header)
+        elif args.format == "json":
+            render_json(results, out=out, pretty=(not args.compact_json))
+        elif args.format == "jsonl":
+            render_jsonl(results, out=out)
+        elif args.format == "csv":
+            render_csv(results, out=out, header=header)
+        elif args.format == "networks":
+            print("error: --format networks is only available in search mode", file=sys.stderr)
             return 2
 
-        if not ip_list:
-            print("error: no IP addresses provided (use positional args or -f FILE)", file=sys.stderr)
-            return 2
-
-        results: List[GeoIPResult] = []
-        strict_fail = False
-
-        try:
-            with GeoIPService(args.asn_db, args.city_db) as svc:
-                for ip in ip_list:
-                    r = svc.lookup(ip, verbose=args.verbose)
-                    results.append(r)
-                    if args.strict and r.status not in ("ok", "partial", "not_found"):
-                        strict_fail = True
-                    if args.strict and r.status == "error":
-                        strict_fail = True
-        except Exception as e:
-            print(f"error: failed to open databases or perform lookups: {e}", file=sys.stderr)
-            return 2
-
-        with open_output(args.output) as out:
-            header = not args.no_header
-
-            if args.format == "pretty":
-                render_pretty(results, out=out, verbose=args.verbose)
-                out.write("\n")
-            elif args.format == "table":
-                render_table(results, out=out, verbose=args.verbose, header=header)
-            elif args.format == "json":
-                render_json(results, out=out, pretty=(not args.compact_json))
-            elif args.format == "jsonl":
-                render_jsonl(results, out=out)
-            elif args.format == "csv":
-                render_csv(results, out=out, header=header)
-            elif args.format == "networks":
-                print("error: --format networks is only available in search mode", file=sys.stderr)
-                return 2
-
-        if strict_fail:
-            return 1
-        return 0
+    if strict_fail:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
