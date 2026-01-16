@@ -65,7 +65,6 @@ Edit `/etc/GeoIP.conf` (or `~/.config/GeoIP.conf`):
 AccountID YOUR_ACCOUNT_ID
 LicenseKey YOUR_LICENSE_KEY
 EditionIDs GeoLite2-ASN GeoLite2-City
-DatabaseDirectory /var/lib/GeoIP
 ```
 
 #### Download the Databases
