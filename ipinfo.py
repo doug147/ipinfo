@@ -37,7 +37,7 @@ import geoip2.errors
 import maxminddb
 
 
-DEFAULT_GEOIP_DIR = Path("/var/lib/GeoIP")
+DEFAULT_GEOIP_DIR = Path("/usr/share/GeoIP")
 DEFAULT_ASN_DB = DEFAULT_GEOIP_DIR / "GeoLite2-ASN.mmdb"
 DEFAULT_CITY_DB = DEFAULT_GEOIP_DIR / "GeoLite2-City.mmdb"
 
