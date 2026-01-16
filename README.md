@@ -71,7 +71,6 @@ DatabaseDirectory /var/lib/GeoIP
 #### Download the Databases
 
 ```bash
-sudo mkdir -p /var/lib/GeoIP
 sudo geoipupdate
 ```
 
